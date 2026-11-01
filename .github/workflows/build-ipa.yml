@@ -4,9 +4,15 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
