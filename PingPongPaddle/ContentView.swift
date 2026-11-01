@@ -15,6 +15,7 @@ final class Sender: ObservableObject {
     private var conn: NWConnection?
     private let haptic = UIImpactFeedbackGenerator(style: .heavy)
     private var counter = 0
+    private var oldBrightness: CGFloat = 0.5
 
     func start(host: String, port: UInt16 = 5005) {
         guard motion.isDeviceMotionAvailable else {
@@ -40,6 +41,8 @@ final class Sender: ObservableObject {
         counter = 0
         haptic.prepare()
         UIApplication.shared.isIdleTimerDisabled = true
+        oldBrightness = UIScreen.main.brightness
+        UIScreen.main.brightness = 0.8     // sáng vừa đủ để camera laptop thấy màu hồng rõ, không bị cháy trắng
         receiveLoop()
 
         motion.deviceMotionUpdateInterval = 1.0 / 100.0
@@ -74,6 +77,7 @@ final class Sender: ObservableObject {
         conn?.cancel()
         conn = nil
         UIApplication.shared.isIdleTimerDisabled = false
+        UIScreen.main.brightness = oldBrightness
         status = "Đã dừng"
     }
 }
@@ -83,6 +87,33 @@ struct ContentView: View {
     @AppStorage("host") private var host = ""
 
     var body: some View {
+        if sender.running {
+            runningView
+        } else {
+            setupView
+        }
+    }
+
+    /// Khi đang chạy: cả màn hình là màu hồng đặc để camera laptop nhìn thấy vợt.
+    private var runningView: some View {
+        ZStack {
+            Color(red: 1.0, green: 0.0, blue: 1.0).ignoresSafeArea()
+            VStack {
+                Spacer()
+                Text("Giữ 1 giây để DỪNG")
+                    .font(.caption).bold()
+                    .foregroundColor(.black)
+                    .padding(10)
+                    .background(Color.white.opacity(0.85))
+                    .cornerRadius(10)
+                    .onLongPressGesture(minimumDuration: 1.0) { sender.stop() }
+                    .padding(.bottom, 30)
+            }
+        }
+        .statusBar(hidden: true)
+    }
+
+    private var setupView: some View {
         VStack(spacing: 24) {
             Text("🏓 Vợt bóng bàn")
                 .font(.largeTitle).bold()
@@ -96,28 +127,23 @@ struct ContentView: View {
                     .padding(12)
                     .background(Color(white: 0.15))
                     .cornerRadius(10)
-                    .disabled(sender.running)
             }
 
             Button(action: {
-                if sender.running { sender.stop() }
-                else { sender.start(host: host.trimmingCharacters(in: .whitespaces)) }
+                sender.start(host: host.trimmingCharacters(in: .whitespaces))
             }) {
-                Text(sender.running ? "DỪNG" : "BẮT ĐẦU")
+                Text("BẮT ĐẦU")
                     .font(.title).bold()
                     .frame(maxWidth: .infinity, minHeight: 90)
-                    .background(sender.running ? Color.red : Color.green)
+                    .background(Color.green)
                     .foregroundColor(.black)
                     .cornerRadius(16)
             }
-            .disabled(host.isEmpty && !sender.running)
+            .disabled(host.isEmpty)
 
             Text(sender.status).foregroundColor(.gray)
-            if sender.running {
-                Text("Đã gửi: \(sender.sent) gói").foregroundColor(.gray)
-                Text("Dán điện thoại lên vợt: ĐỈNH máy hướng về đầu vợt,\nmàn hình hướng ra phía mặt vợt.\nGiữ vợt tư thế sẵn sàng rồi nhấn SPACE trên máy tính.")
-                    .font(.footnote).multilineTextAlignment(.center).foregroundColor(.gray)
-            }
+            Text("Sau khi bấm BẮT ĐẦU, màn hình sẽ chuyển sang màu hồng để camera laptop theo dõi vợt.\nDán điện thoại lên vợt: đỉnh máy hướng về đầu vợt, màn hình quay ra ngoài (về phía camera).")
+                .font(.footnote).multilineTextAlignment(.center).foregroundColor(.gray)
             Spacer()
         }
         .padding(24)
