@@ -1,0 +1,27 @@
+name: PingPongPaddle
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "14.0"
+targets:
+  PingPongPaddle:
+    type: application
+    platform: iOS
+    sources:
+      - PingPongPaddle
+    info:
+      path: PingPongPaddle/Info.plist
+      properties:
+        CFBundleDisplayName: Vot Bong Ban
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSMotionUsageDescription: Ung dung doc cam bien chuyen dong de dieu khien vot bong ban.
+        NSLocalNetworkUsageDescription: Ung dung gui du lieu cam bien den may tinh trong mang WiFi.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.pingpongpaddle
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
