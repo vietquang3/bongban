@@ -1,29 +1,47 @@
 """
-BÓNG BÀN - ĐIỆN THOẠI LÀ VỢT
-Chạy trên laptop (Windows). Điện thoại iPhone gắn trên vợt gửi cảm biến qua WiFi (UDP cổng 5005).
-Không có điện thoại vẫn chơi được bằng chuột (click = đập mạnh).
+BÓNG BÀN - CAMERA THEO DÕI VỢT  (chỉ dùng camera, không cần cảm biến điện thoại)
 
-Phím:  SPACE = căn chỉnh (giữ vợt tư thế sẵn sàng)   R = chơi lại
-       [ / ] = giảm/tăng độ nhạy     I = đảo trái-phải    O = đảo lên-xuống
-       T = đổi trục (nếu gắn máy xoay ngang)   1/2/3 = độ khó   ESC = thoát
+CÁCH HOẠT ĐỘNG
+  * Mở app trên iPhone -> bấm "BẬT MÀN HÌNH VỢT" -> màn hình điện thoại sáng màu hồng (magenta).
+  * Dán điện thoại lên vợt, quay màn hình hồng về phía camera laptop.
+  * Camera tìm vật màu hồng -> biết vợt ở đâu (trái/phải, cao/thấp, tiến/lùi theo kích thước vật),
+    nghiêng đầu vợt bao nhiêu (theo hướng trục dài của điện thoại) và vung nhanh hay chậm (theo tốc độ).
+  * Không có camera thì chơi bằng chuột.
+
+PHÍM
+  SPACE  căn chỉnh (cầm vợt tư thế sẵn sàng, màn hình hồng hướng về camera)   R  chơi lại
+  Click vào khung camera (góc trên phải) để chọn đúng màu vợt nếu nó không bắt được
+  C  đổi camera (0/1/2)    V  ẩn/hiện khung camera
+  , .  độ nhạy di chuyển    H  hút bóng (0/30/60%)    1/2/3  độ khó
+  M  chuyển qua lại giữa camera / chuột    ESC  thoát
 """
 import math
+import os
 import random
-import socket
 import sys
 import threading
 import time
-from collections import deque
 
-PORT = 5005
+try:
+    import cv2
+    import numpy as np
+except ImportError:      # chưa cài opencv -> vẫn chạy, chỉ không có camera
+    cv2 = None
+    np = None
+
 W, H = 1280, 720
 G = 9.8
 TL, TW = 2.74, 1.525          # chiều dài / rộng bàn (m)
 NET_H = 0.1525
 ZN = TL / 2
 CAM_Z, CAM_H, FOCAL, HY = 1.9, 0.9, 760.0, 240
-PADDLE_R = 95                 # bán kính vùng chạm vợt (pixel)
-PADDLE_Y0 = 518               # vị trí y mặc định của vợt trên màn hình
+PADDLE_Y0 = 518               # (chỉ dùng cho chuột) y mặc định trên màn hình
+HIT_R = 0.17                  # bán kính vùng chạm của vợt (m)
+PADDLE_R_WORLD = 0.13         # bán kính vẽ mặt vợt (m)
+PAD_X0, PAD_Y0W, PAD_Z0 = 0.0, 0.30, -0.25   # vị trí vợt ban đầu trong không gian (m)
+CAM_D0 = 0.7                  # khoảng cách ước lượng từ vợt tới camera (m)
+CAM_VIEW_W, CAM_VIEW_H = 0.70, 0.52     # bề ngang/cao (m) camera nhìn thấy ở khoảng cách chơi -> đổi tốc độ vung ra m/s
+CAM_GX, CAM_GY, CAM_GZ = 1.8, 1.4, 2.4   # hệ số đổi chuyển động trước camera -> chuyển động vợt trong game
 WIN_SCORE = 11
 
 
@@ -42,106 +60,168 @@ def proj(x, y, z):
     return W / 2 + x * s, HY + (CAM_H - y) * s, s
 
 
-# ---------------- Quaternion ----------------
-def qmul(a, b):
-    w1, x1, y1, z1 = a
-    w2, x2, y2, z2 = b
-    return (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+class OneEuro:
+    """Lọc mượt khi tay đứng yên (hết rung), vẫn nhạy khi vung nhanh."""
+    def __init__(self, mincut=1.5, beta=1.5, dcut=1.0):
+        self.mincut, self.beta, self.dcut = mincut, beta, dcut
+        self.x = None
+        self.dx = 0.0
+
+    @staticmethod
+    def _alpha(cut, dt):
+        tau = 1.0 / (2 * math.pi * cut)
+        return 1.0 / (1.0 + tau / max(dt, 1e-4))
+
+    def __call__(self, v, dt):
+        if self.x is None:
+            self.x = v
+            return v
+        dx = (v - self.x) / max(dt, 1e-4)
+        self.dx += self._alpha(self.dcut, dt) * (dx - self.dx)
+        cut = self.mincut + self.beta * abs(self.dx)
+        self.x += self._alpha(cut, dt) * (v - self.x)
+        return self.x
+
+    def reset(self):
+        self.x = None
+        self.dx = 0.0
 
 
-def qconj(q):
-    return (q[0], -q[1], -q[2], -q[3])
+# ---------------- Camera: theo dõi màn hình điện thoại (màu hồng) ----------------
+# Trả về: vị trí tâm, kích thước, và độ nghiêng của trục dài (đầu vợt) so với phương thẳng đứng.
+class CameraTracker:
+    FW, FH = 320, 240
 
-
-def qrot(q, v):
-    r = qmul(qmul(q, (0.0,) + tuple(v)), qconj(q))
-    return r[1], r[2], r[3]
-
-
-def local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return "127.0.0.1"
-    finally:
-        s.close()
-
-
-# ---------------- Nhận dữ liệu từ điện thoại ----------------
-class Sensor:
-    def __init__(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", PORT))
-        self.sock.settimeout(0.5)
+    def __init__(self, index=0):
+        self.available = cv2 is not None
+        self.index = index
+        self.restart = False
+        self.stop = False
         self.lock = threading.Lock()
-        self.q = (1.0, 0.0, 0.0, 0.0)
-        self.q0 = (1.0, 0.0, 0.0, 0.0)
-        self.acc = deque()
-        self.last = 0.0
-        self.addr = None
-        self.packets = 0
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.hue, self.tol, self.smin, self.vmin = 150, 14, 100, 100   # hồng/magenta (OpenCV hue 0..179)
+        self.cx = self.cy = self.size = 0.0
+        self.tilt = 0.0          # rad, dương = đầu vợt nghiêng sang phải (theo màn hình)
+        self.opened = False      # camera đã mở được chưa
+        self.last_seen = 0.0
+        self.frame_bytes = None
+        self.hsv = None
+        self.status = "Chưa cài opencv-python" if not self.available else "Đang mở camera..."
+        if self.available:
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def _open(self):
+        cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(self.index)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+        return cap
+
+    def _mask(self, hsv):
+        h, t = self.hue, self.tol
+        lo_s, lo_v = self.smin, self.vmin
+        if h - t < 0:
+            m1 = cv2.inRange(hsv, (0, lo_s, lo_v), (h + t, 255, 255))
+            m2 = cv2.inRange(hsv, (180 + h - t, lo_s, lo_v), (179, 255, 255))
+            return cv2.bitwise_or(m1, m2)
+        if h + t > 179:
+            m1 = cv2.inRange(hsv, (h - t, lo_s, lo_v), (179, 255, 255))
+            m2 = cv2.inRange(hsv, (0, lo_s, lo_v), (h + t - 180, 255, 255))
+            return cv2.bitwise_or(m1, m2)
+        return cv2.inRange(hsv, (h - t, lo_s, lo_v), (h + t, 255, 255))
 
     def _loop(self):
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(512)
-            except socket.timeout:
+        cap = None
+        kernel = np.ones((3, 3), np.uint8)
+        while not self.stop:
+            if cap is None or self.restart:
+                if cap is not None:
+                    cap.release()
+                self.restart = False
+                cap = self._open()
+                self.opened = cap.isOpened()
+                if not cap.isOpened():
+                    self.status = f"Không mở được camera {self.index} (nhấn C để đổi)"
+                    cap = None
+                    time.sleep(1.0)
+                    continue
+                self.status = f"Camera {self.index}"
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.03)
                 continue
-            except OSError:
-                break
-            try:
-                x, y, z, w, ax, ay, az = map(float, data.decode().strip().split(","))
-            except ValueError:
-                continue
-            n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
-            now = time.time()
+            frame = cv2.flip(frame, 1)                         # lật gương: tay phải của bạn -> bên phải màn hình
+            small = cv2.resize(frame, (self.FW, self.FH))
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            mask = self._mask(hsv)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            found = None
+            if cnts:
+                c = max(cnts, key=cv2.contourArea)
+                area = cv2.contourArea(c)
+                if area >= 80:
+                    m = cv2.moments(c)
+                    if m["m00"] > 0:
+                        tilt = None
+                        mu20, mu02, mu11 = m["mu20"] / m["m00"], m["mu02"] / m["m00"], m["mu11"] / m["m00"]
+                        common = math.sqrt(4 * mu11 * mu11 + (mu20 - mu02) ** 2)
+                        l1, l2 = (mu20 + mu02 + common) / 2, (mu20 + mu02 - common) / 2
+                        if l2 > 1e-6 and math.sqrt(l1 / l2) >= 1.3:      # đủ dài mới tin hướng
+                            phi = 0.5 * math.atan2(2 * mu11, mu20 - mu02)  # góc trục dài (hệ ảnh, y xuống)
+                            vx, vy = math.cos(phi), math.sin(phi)
+                            if vy > 0:                                      # luôn lấy chiều hướng lên
+                                vx, vy = -vx, -vy
+                            tilt = math.atan2(vx, -vy)
+                        found = (m["m10"] / m["m00"], m["m01"] / m["m00"], math.sqrt(area), c, tilt)
+            vis = small.copy()
+            if found:
+                cv2.drawContours(vis, [found[3]], -1, (0, 255, 0), 2)
+                cv2.circle(vis, (int(found[0]), int(found[1])), 5, (0, 255, 255), -1)
+                if found[4] is not None:      # vẽ trục đầu vợt
+                    L = found[2] * 0.9
+                    p2 = (int(found[0] + math.sin(found[4]) * L), int(found[1] - math.cos(found[4]) * L))
+                    cv2.line(vis, (int(found[0]), int(found[1])), p2, (255, 255, 0), 2)
+            rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
             with self.lock:
-                self.q = (w / n, x / n, y / n, z / n)
-                self.addr = addr
-                self.last = now
-                self.packets += 1
-                self.acc.append((now, math.sqrt(ax * ax + ay * ay + az * az)))
-                while self.acc and now - self.acc[0][0] > 0.2:
-                    self.acc.popleft()
+                self.hsv = hsv
+                self.frame_bytes = rgb.tobytes()
+                if found:
+                    self.cx = found[0] / self.FW
+                    self.cy = found[1] / self.FH
+                    self.size = found[2] / self.FH
+                    if found[4] is not None:
+                        self.tilt = found[4]
+                    self.last_seen = time.time()
+        if cap is not None:
+            cap.release()
 
-    @property
-    def connected(self):
-        return time.time() - self.last < 1.0
-
-    def calibrate(self):
+    def get(self):
         with self.lock:
-            self.q0 = self.q
+            vis = time.time() - self.last_seen < 0.35
+            return vis, self.cx, self.cy, self.size, self.tilt
 
-    def aim(self):
-        """Hướng 'đỉnh điện thoại' (trục Y máy) so với lúc căn chỉnh, tính trong hệ máy lúc đó."""
+    def preview(self):
         with self.lock:
-            d = qmul(qconj(self.q0), self.q)
-        return qrot(d, (0.0, 1.0, 0.0))
+            return self.frame_bytes
 
-    def peak(self, window=0.12):
-        now = time.time()
+    def pick_color(self, px, py):
+        """Người chơi click vào khung camera -> lấy màu tại đó làm màu vợt."""
         with self.lock:
-            vals = [m for t, m in self.acc if now - t <= window]
-        return max(vals) if vals else 0.0
-
-    def haptic(self):
-        with self.lock:
-            addr = self.addr
-        if addr:
-            try:
-                self.sock.sendto(b"H", addr)
-            except OSError:
-                pass
+            hsv = self.hsv
+            if hsv is None:
+                return
+            x, y = int(clamp(px, 3, self.FW - 4)), int(clamp(py, 3, self.FH - 4))
+            patch = hsv[y - 2:y + 3, x - 2:x + 3].reshape(-1, 3)
+            h, s, v = [int(np.median(patch[:, i])) for i in range(3)]
+            if s < 50 or v < 50:
+                self.status = "Màu quá nhạt/tối, chọn chỗ màu rực hơn"
+                return
+            self.hue = h
+            self.smin = int(max(60, s * 0.55))
+            self.vmin = int(max(60, v * 0.5))
+            self.status = f"Đã chọn màu (hue {h})"
 
 
 # ---------------- Luật + vật lý ----------------
@@ -166,7 +246,7 @@ class Game:
         self.hit_cd = 0.0
         self.vx = self.vy = self.vz = 0.0
         if self.server == "P":
-            self.x, self.y, self.z = 0.0, 0.35, 0.15
+            self.x, self.y, self.z = 0.0, 0.35, -0.05
         else:
             self.x, self.y, self.z = 0.0, 0.30, TL + 0.1
             self.timer = 1.3
@@ -232,11 +312,16 @@ class Game:
         if why:
             self.msg += " - " + why
 
+    def paddle_touch(self, paddle, r, dz_max):
+        dx, dy, dz = self.x - paddle[0], self.y - paddle[1], self.z - paddle[2]
+        return math.hypot(dx, dy) < r and abs(dz) < dz_max
+
     def screen_pos(self):
         sx, sy, s = proj(self.x, self.y, self.z)
         return sx, sy, s
 
-    def update(self, dt, paddle_xy, xn, power, swing_click, on_hit):
+    def update(self, dt, paddle, xn, power, on_hit):
+        """paddle = (x, y, z) vị trí vợt trong không gian (m)."""
         self.hit_cd -= dt
         if self.state == "pause":
             self.timer -= dt
@@ -251,8 +336,7 @@ class Game:
                 if self.timer <= 0:
                     self.ai_serve()
             else:
-                sx, sy, _ = self.screen_pos()
-                if math.hypot(sx - paddle_xy[0], sy - paddle_xy[1]) < PADDLE_R and power > 0.3:
+                if self.paddle_touch(paddle, 0.22, 0.45) and power > 0.3:
                     self.player_hit(xn, max(power, 0.35))
                     on_hit()
             return
@@ -305,11 +389,9 @@ class Game:
             return
 
         # Người chơi đỡ bóng
-        if self.hitter == "A" and self.recv >= 1 and self.vz < 0 and -1.3 < self.z < 0.5 and self.hit_cd <= 0:
-            sx, sy, _ = self.screen_pos()
-            if math.hypot(sx - paddle_xy[0], sy - paddle_xy[1]) < PADDLE_R:
-                p = max(power, 0.15)
-                self.player_hit(xn, p)
+        if self.hitter == "A" and self.recv >= 1 and self.vz < 0 and self.hit_cd <= 0:
+            if self.paddle_touch(paddle, HIT_R, 0.24):
+                self.player_hit(xn, max(power, 0.15))
                 on_hit()
 
 
@@ -337,22 +419,33 @@ def main():
     beep_hit, beep_ai, beep_bounce = make_beep(900), make_beep(600), make_beep(300, 40)
 
     screen = pygame.display.set_mode((W, H), pygame.RESIZABLE | pygame.SCALED)
-    pygame.display.set_caption("Bóng bàn - điện thoại là vợt")
+    pygame.display.set_caption("Bóng bàn - camera theo dõi vợt")
     clock = pygame.time.Clock()
     fn = lambda sz, b=False: pygame.font.SysFont("segoeui,arial,dejavusans", sz, bold=b)
     f_big, f_mid, f_small = fn(64, True), fn(30, True), fn(20)
 
-    sensor = Sensor()
-    ip = local_ip()
+    cam = CameraTracker(0)
     game = Game(2)
 
-    gain, inv_x, inv_y, swap = 3.0, 1.0, 1.0, False
-    px = py = None
+    filt = {'ang': OneEuro(mincut=1.0, beta=0.5)}
+    filt.update({k: OneEuro(mincut=2.0, beta=2.0) for k in ('cx', 'cy', 'cs')})
+    cam_ref = None
+    want_cal = False
+    prev_cam = None      # (cx, cy, fwd) của khung hình trước -> tính tốc độ vung
+    swing = 0.0          # lực vung 0..1 (giữ đỉnh ngắn để kịp tính khi chạm bóng)
+    mouse_mode = False
+    show_prev = True
+    PREV = pygame.Rect(W - 336, 8, 320, 240)
+    pw = [PAD_X0, PAD_Y0W, PAD_Z0]   # vị trí vợt trong không gian 3D (m)
     mouse_prev = pygame.mouse.get_pos()
     mouse_power = 0.0
     click_power = 0.0
     flash = 0.0
     prev_bounce_recv = 0
+    ang_s = 0.0
+    move_scale = 1.0
+    assist = 0.3         # hút nhẹ vợt về phía bóng khi bóng tới (0 = tắt)
+    mouse_depth = 0.0
 
     def on_hit(ai=False):
         nonlocal flash
@@ -363,7 +456,6 @@ def main():
             flash = 0.2
             if beep_hit:
                 beep_hit.play()
-            sensor.haptic()
 
     def draw_table():
         pts = [proj(-TW / 2, 0, 0), proj(TW / 2, 0, 0), proj(TW / 2, 0, TL), proj(-TW / 2, 0, TL)]
@@ -410,12 +502,43 @@ def main():
         pygame.draw.circle(screen, (200, 40, 40), (int(sx), int(sy)), r)
         pygame.draw.circle(screen, (20, 20, 20), (int(sx), int(sy)), r, 2)
 
-    def draw_paddle(x, y):
-        pygame.draw.rect(screen, (150, 100, 50), (x - 8, y + 40, 16, 90), border_radius=4)
-        col = (255, 255, 255) if flash > 0 else (210, 35, 35)
-        pygame.draw.circle(screen, col, (int(x), int(y)), 70)
-        pygame.draw.circle(screen, (15, 15, 15), (int(x), int(y)), 70, 4)
-        pygame.draw.circle(screen, (255, 255, 255), (int(x), int(y)), PADDLE_R, 1)
+    def draw_paddle(x, y, ang, roll, scale=1.0):
+        """Vẽ vợt thật: xoay theo cổ tay (ang) và lật mặt đỏ/đen theo roll."""
+        S = 380
+        c = S // 2
+        surf = pygame.Surface((S, S), pygame.SRCALPHA)
+        k = math.cos(roll)
+        front = k >= 0
+        w = max(abs(k), 0.10) * 70
+        h = 78
+        # tay cầm
+        pygame.draw.rect(surf, (175, 125, 65), (c - 11, c + h - 14, 22, 112), border_radius=8)
+        pygame.draw.rect(surf, (110, 72, 36), (c - 11, c + h - 14, 22, 112), 2, border_radius=8)
+        # viền gỗ + mặt vợt
+        pygame.draw.ellipse(surf, (205, 165, 105), (c - w - 6, c - h - 6, 2 * w + 12, 2 * h + 12))
+        if flash > 0:
+            face = (255, 255, 255)
+        elif abs(k) < 0.18:
+            face = (205, 165, 105)
+        else:
+            face = (205, 35, 35) if front else (25, 25, 25)
+        pygame.draw.ellipse(surf, face, (c - w, c - h, 2 * w, 2 * h))
+        pygame.draw.ellipse(surf, (240, 240, 240), (c - w, c - h, 2 * w, 2 * h), 2)
+        if abs(k) > 0.4:
+            pygame.draw.circle(surf, (245, 245, 245) if front else (200, 200, 200), (c, c), int(14 * abs(k)), 2)
+        if abs(scale - 1.0) > 0.02:
+            surf = pygame.transform.smoothscale(surf, (int(S * scale), int(S * scale)))
+        rot = pygame.transform.rotate(surf, -math.degrees(ang))
+        screen.blit(rot, rot.get_rect(center=(int(x), int(y))))
+        
+    def draw_paddle_shadow(wx, wy, wz):
+        sx, sy, s = proj(wx, wy, wz)
+        gx, gy, _ = proj(wx, 0.0, wz)
+        surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        pygame.draw.line(surf, (255, 255, 255, 70), (sx, sy), (gx, gy), 1)
+        rw, rh = int(0.16 * s), max(3, int(0.05 * s))
+        pygame.draw.ellipse(surf, (0, 0, 0, 110), (gx - rw, gy - rh, 2 * rw, 2 * rh))
+        screen.blit(surf, (0, 0))
 
     running = True
     last = time.time()
@@ -433,93 +556,163 @@ def main():
                 if k == pygame.K_ESCAPE:
                     running = False
                 elif k == pygame.K_SPACE:
-                    sensor.calibrate()
+                    for f in filt.values():
+                        f.reset()
+                    want_cal = True
                 elif k == pygame.K_r:
                     game.reset()
-                elif k == pygame.K_i:
-                    inv_x = -inv_x
-                elif k == pygame.K_o:
-                    inv_y = -inv_y
-                elif k == pygame.K_t:
-                    swap = not swap
-                elif k == pygame.K_LEFTBRACKET:
-                    gain = max(0.8, gain - 0.3)
-                elif k == pygame.K_RIGHTBRACKET:
-                    gain = min(8.0, gain + 0.3)
+                elif k == pygame.K_m:
+                    mouse_mode = not mouse_mode
+                elif k == pygame.K_h:
+                    assist = {0.0: 0.3, 0.3: 0.6, 0.6: 0.0}.get(assist, 0.3)
+                elif k == pygame.K_v:
+                    show_prev = not show_prev
+                elif k == pygame.K_c:
+                    cam.index = (cam.index + 1) % 3
+                    cam.restart = True
+                elif k == pygame.K_COMMA:
+                    move_scale = max(0.4, move_scale - 0.15)
+                elif k == pygame.K_PERIOD:
+                    move_scale = min(3.0, move_scale + 0.15)
                 elif k in (pygame.K_1, pygame.K_2, pygame.K_3):
                     game.difficulty = {pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3}[k]
+            elif e.type == pygame.MOUSEWHEEL:
+                mouse_depth = clamp(mouse_depth + 0.06 * e.y, -0.1, 0.45)
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                click_power = 1.0
+                if show_prev and cam.available and not mouse_mode and PREV.collidepoint(e.pos):
+                    cam.pick_color(e.pos[0] - PREV.x, e.pos[1] - PREV.y)
+                else:
+                    click_power = 1.0
 
-        # ---- đọc vợt ----
-        use_sensor = sensor.connected
-        if use_sensor:
-            ax, ay, az = sensor.aim()
-            a, b = (az, ax) if swap else (ax, az)
-            xn = clamp(a * gain * inv_x, -1.3, 1.3)
-            yn = clamp(-b * gain * inv_y, -1.3, 1.3)
-            tx, ty = W / 2 + xn * W * 0.35, PADDLE_Y0 - yn * 180
-            peak = sensor.peak()
-            power = clamp((peak - 0.6) / 2.5, 0.0, 1.0)
+        # ================= ĐỌC VỢT (chỉ camera) =================
+        cam_vis, ccx, ccy, csz, ctilt = cam.get() if cam.available else (False, 0.0, 0.0, 0.0, 0.0)
+        cam_ok = cam.available and cam.opened and not mouse_mode
+        ang = 0.0
+        power = 0.0
+        twx, twy, twz = pw
+
+        if cam_ok and cam_vis:
+            pos_src = "camera"
+            fcx, fcy, fcs = filt['cx'](ccx, dt), filt['cy'](ccy, dt), filt['cs'](csz, dt)
+            ang = clamp(filt['ang'](ctilt, dt), -1.2, 1.2)
+            if cam_ref is None or want_cal:
+                cam_ref = (fcx, fcy, fcs)
+                want_cal = False
+                prev_cam = None
+            fwd = clamp(CAM_D0 * (1.0 - cam_ref[2] / max(fcs, 1e-3)), -0.35, 0.6)
+            twx = PAD_X0 + (fcx - cam_ref[0]) * CAM_GX * move_scale
+            twy = PAD_Y0W + (cam_ref[1] - fcy) * CAM_GY * move_scale
+            twz = PAD_Z0 + fwd * CAM_GZ * move_scale
+            # lực vung = tốc độ tay (m/s ước lượng) theo mọi hướng
+            if prev_cam is not None:
+                vx = (fcx - prev_cam[0]) * CAM_VIEW_W / max(dt, 1e-3)
+                vy = (fcy - prev_cam[1]) * CAM_VIEW_H / max(dt, 1e-3)
+                vz = (fwd - prev_cam[2]) / max(dt, 1e-3)
+                level = clamp((math.hypot(vx, vy, vz) - 0.35) / 1.5, 0.0, 1.0)
+                swing = max(level, swing - dt * 4.0)
+            prev_cam = (fcx, fcy, fwd)
+            power = swing
+        elif cam_ok:
+            # camera đang mở nhưng không thấy vợt (mờ do vung nhanh / quay lưng): giữ nguyên vị trí
+            pos_src = "camera (mất dấu - giữ vị trí)"
+            prev_cam = None
+            ang = ang_s
+            swing = max(0.0, swing - dt * 4.0)
+            power = swing
         else:
+            pos_src = "chuột"
+            prev_cam = None
             mx, my = pygame.mouse.get_pos()
             speed = math.hypot(mx - mouse_prev[0], my - mouse_prev[1]) / max(dt, 1e-3)
             mouse_prev = (mx, my)
             mouse_power = max(mouse_power * (1 - dt * 6), clamp(speed / 2500.0, 0, 1))
             power = max(mouse_power, click_power)
-            tx, ty = mx, clamp(my, 330, 700)
-            xn = clamp((mx - W / 2) / (W * 0.35), -1.3, 1.3)
-        if px is None:
-            px, py = tx, ty
-        px += (tx - px) * 0.45
-        py += (ty - py) * 0.45
+            twx = (mx - W / 2) / (W * 0.35) * 0.75
+            twy = 0.30 + (PADDLE_Y0 - clamp(my, 330, 700)) / 180.0 * 0.3
+            twz = PAD_Z0 + mouse_depth * 3.2
+            ang = clamp(twx * 0.5, -0.8, 0.8)
+        twx, twy, twz = clamp(twx, -1.0, 1.0), clamp(twy, 0.05, 0.9), clamp(twz, -0.7, 1.4)
+
+        k_s = 1.0 - math.exp(-dt * 25.0)
+        pw[0] += (twx - pw[0]) * k_s
+        pw[1] += (twy - pw[1]) * k_s
+        pw[2] += (twz - pw[2]) * k_s
+        ang_s += (ang - ang_s) * 0.5
+
+        # hút nhẹ vợt về phía bóng đang tới
+        if assist > 0 and game.state == "rally" and game.hitter == "A" and game.recv >= 1 and game.vz < 0 and game.z < 1.3:
+            pull = clamp(assist * dt * 6.0 * clamp((1.3 - game.z) / 1.3, 0.0, 1.0), 0.0, 0.5)
+            pw[0] += (game.x - pw[0]) * pull
+            pw[1] += (clamp(game.y, 0.05, 0.9) - pw[1]) * pull
+            pw[2] += (game.z - pw[2]) * pull * 0.6
+        elif assist > 0 and game.state == "serve" and game.server == "P":
+            pull = clamp(assist * dt * 2.0, 0.0, 0.3)
+            pw[0] += (game.x - pw[0]) * pull
+            pw[1] += (game.y - pw[1]) * pull
+
+        xn_shot = clamp(pw[0] / 0.6, -1.4, 1.4)
 
         flash = max(0.0, flash - dt)
         if not game.over or game.state != "pause":
-            game.update(dt, (px, py), xn, power, click_power > 0, on_hit)
-        # tiếng nảy
+            game.update(dt, tuple(pw), xn_shot, power, on_hit)
         total_recv = game.recv
         if total_recv != prev_bounce_recv and beep_bounce:
             beep_bounce.play()
         prev_bounce_recv = total_recv
 
-        # ---- vẽ ----
+        # ================= VẼ =================
         screen.fill((24, 26, 34))
         pygame.draw.rect(screen, (40, 44, 56), (0, HY, W, H - HY))
         draw_table()
         draw_ai()
-        if game.z < ZN:
-            draw_net()
-            draw_ball()
-        else:
-            draw_ball()
-            draw_net()
-        draw_paddle(px, py)
+        draw_paddle_shadow(*pw)
+        psx, psy, ps = proj(*pw)
+        items = [("net", ZN), ("ball", game.z), ("paddle", pw[2])]
+        items.sort(key=lambda t: -t[1])
+        for name, _z in items:
+            if name == "net":
+                draw_net()
+            elif name == "ball":
+                draw_ball()
+            else:
+                draw_paddle(psx, psy, ang_s, 0.0, PADDLE_R_WORLD * ps / 70.0)
 
         t = f_big.render(f"{game.score['P']} : {game.score['A']}", True, (255, 255, 255))
         screen.blit(t, (W // 2 - t.get_width() // 2, 14))
         screen.blit(f_small.render("BẠN", True, (160, 200, 255)), (W // 2 - 120, 36))
         screen.blit(f_small.render("MÁY", True, (255, 170, 170)), (W // 2 + 82, 36))
-        if use_sensor:
-            st = f"Điện thoại: ĐÃ KẾT NỐI  ({sensor.packets} gói)"
-            col = (120, 255, 140)
+        if not cam.available:
+            ct, cc = "Camera: chưa cài opencv-python (pip install opencv-python) - đang chơi bằng chuột", (255, 150, 120)
+        elif mouse_mode:
+            ct, cc = "Đang chơi bằng CHUỘT (nhấn M để quay lại camera)", (255, 210, 100)
+        elif not cam.opened:
+            ct, cc = f"Camera: {cam.status}", (255, 150, 120)
+        elif cam_vis:
+            ct, cc = f"Camera: THẤY VỢT ({cam.status})", (120, 255, 140)
         else:
-            st = f"Chưa có điện thoại - chơi bằng chuột.   Nhập IP này vào app:  {ip}"
-            col = (255, 210, 100)
-        screen.blit(f_small.render(st, True, col), (16, 12))
-        screen.blit(f_small.render(f"Độ khó {game.difficulty}  |  độ nhạy {gain:.1f}  |  Lực: {int(power*100)}%", True, (170, 170, 180)), (16, 40))
-        hint = "Giao bóng: đưa vợt vào bóng rồi vung mạnh" if game.state == "serve" and game.server == "P" else ""
-        if hint:
-            h = f_mid.render(hint, True, (255, 255, 255))
+            ct, cc = f"Camera: không thấy vợt - bật màn hình hồng trong app rồi hướng về camera, hoặc click chọn màu ({cam.status})", (255, 210, 100)
+        screen.blit(f_small.render(ct, True, cc), (16, 12))
+        info = (f"Vị trí: {pos_src} | độ khó {game.difficulty} | di chuyển x{move_scale:.2f} | "
+                f"lực {int(power*100)}% | hút bóng {int(assist*100)}% | tiến {int((pw[2]-PAD_Z0)*100):+d}cm")
+        screen.blit(f_small.render(info, True, (170, 170, 180)), (16, 38))
+        if game.state == "serve" and game.server == "P":
+            h = f_mid.render("Giao bóng: đưa vợt tới quả bóng rồi vung mạnh", True, (255, 255, 255))
             screen.blit(h, (W // 2 - h.get_width() // 2, 110))
         if game.msg:
             m = f_mid.render(game.msg, True, (255, 240, 120))
             screen.blit(m, (W // 2 - m.get_width() // 2, 150))
-        screen.blit(f_small.render("SPACE căn chỉnh | R chơi lại | [ ] độ nhạy | I/O đảo trục | T đổi trục | 1-3 độ khó",
+        if show_prev and cam.available and not mouse_mode:
+            pb = cam.preview()
+            if pb:
+                screen.blit(pygame.image.frombuffer(pb, (cam.FW, cam.FH), "RGB"), PREV.topleft)
+            pygame.draw.rect(screen, (255, 255, 255), PREV, 2)
+            screen.blit(f_small.render("click vào vợt để chọn màu", True, (255, 255, 255)), (PREV.x + 6, PREV.bottom - 24))
+        screen.blit(f_small.render("SPACE căn chỉnh | R chơi lại | C đổi camera | V khung camera | , . di chuyển | H hút bóng | M chuột/camera | 1-3 độ khó",
                                    True, (130, 130, 145)), (16, H - 28))
         pygame.display.flip()
         clock.tick(60)
 
+    cam.stop = True
     pygame.quit()
     sys.exit()
 
