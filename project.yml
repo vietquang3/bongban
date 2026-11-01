@@ -16,8 +16,6 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        NSMotionUsageDescription: Ung dung doc cam bien chuyen dong de dieu khien vot bong ban.
-        NSLocalNetworkUsageDescription: Ung dung gui du lieu cam bien den may tinh trong mang WiFi.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.pingpongpaddle
